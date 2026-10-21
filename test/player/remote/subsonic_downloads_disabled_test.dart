@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -23,9 +22,10 @@ import 'package:vynody/player/sharing/sharing_service.dart';
 import 'package:vynody/utils/localized_text.dart';
 
 /// Navidrome 关闭下载时，`download.view` 仍然回 HTTP 200，只是响应体换成失败
-/// JSON（code 50）。这些用例锁住两件事：
+/// JSON（code 50）。这些用例锁住三件事：
 ///  1. 错误体绝不会被当音频落盘、也不会被标成「已完成」；
-///  2. 用户能收到「服务端已关闭下载」的提示（任务错误文案 + Toast）。
+///  2. 收到 code 50 时改走播放通道 `stream`，下载任务照常完成；
+///  3. 连播放通道都失败时，任务失败并给出「服务端已关闭下载」的提示。
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -196,6 +196,7 @@ void main() {
       Map<String, dynamic>? downloadError,
       String? htmlBody,
       int? downloadStatusCode,
+      bool streamFails = false,
       RemoteServerType serverType = RemoteServerType.subsonic,
     }) async {
       SharedPreferences.setMockInitialValues({});
@@ -220,6 +221,7 @@ void main() {
         audioBytes: audioBytes,
         htmlBody: htmlBody,
         downloadStatusCode: downloadStatusCode,
+        streamFails: streamFails,
       );
       final server = RemoteServer(
         id: 'srv',
@@ -241,7 +243,7 @@ void main() {
           trackNumber: 1,
         );
 
-    test('code 50：任务失败、错误文案为「服务端已关闭下载」、错误体不落盘', () async {
+    test('code 50：download 被拒后改走播放通道，任务完成且落盘真实音频', () async {
       final (:container, :fake, :server) = await bootstrap(
         downloadError: {'code': 50, 'message': 'downloads are disabled'},
       );
@@ -262,12 +264,42 @@ void main() {
 
       final finished =
           await _waitForTerminal(container, tasks.single.id);
+      expect(finished.status, RemoteDownloadStatus.completed);
+      expect(finished.error, isNull);
+
+      // 先试 download.view（失败体），再走 stream（真音频）；落盘的是音频本身。
+      expect(fake.requestedPaths, hasLength(2));
+      expect(fake.requestedPaths.first, endsWith('/download.view'));
+      expect(fake.requestedPaths.last, endsWith('/stream'));
+      final saved = File(finished.targetPath);
+      expect(saved.existsSync(), isTrue);
+      expect(saved.readAsBytesSync(), audioBytes);
+    });
+
+    test('code 50 且播放通道也被禁：任务失败、文案指向关闭下载、错误体不落盘', () async {
+      final (:container, :fake, :server) = await bootstrap(
+        downloadError: {'code': 50, 'message': 'downloads are disabled'},
+        streamFails: true,
+      );
+      addTearDown(() async {
+        await fake.stop();
+        container.dispose();
+      });
+
+      final notifier = container.read(remoteDownloadTasksProvider.notifier);
+      final tasks = await notifier.enqueue(
+        RemoteDownloadRequest(
+          server: server,
+          password: 'pw',
+          songs: [song('tr_50_both')],
+        ),
+      );
+
+      final finished = await _waitForTerminal(container, tasks.single.id);
       expect(finished.status, RemoteDownloadStatus.failed);
       expect(finished.error, currentAppL10n.remoteServerDownloadsDisabled);
-
-      // 目标文件绝不能出现——否则音乐库里会多出一首 200 字节的「坏歌」。
+      expect(fake.requestedPaths, hasLength(2));
       expect(File(finished.targetPath).existsSync(), isFalse);
-      expect(fake.downloadHits, 1);
     });
 
     test('其它错误码：任务失败，错误体同样不落盘', () async {
@@ -420,7 +452,7 @@ void main() {
       expect(fake.downloadHits, 1);
     });
 
-    test('批量下载：同服务器只提示一次，其余任务照常失败', () async {
+    test('批量下载：每首都回退到播放通道并完成', () async {
       final (:container, :fake, :server) = await bootstrap(
         downloadError: {'code': 50, 'message': 'downloads are disabled'},
       );
@@ -440,9 +472,15 @@ void main() {
       expect(tasks, hasLength(2));
       for (final task in tasks) {
         final finished = await _waitForTerminal(container, task.id);
-        expect(finished.status, RemoteDownloadStatus.failed);
+        expect(finished.status, RemoteDownloadStatus.completed);
+        expect(File(finished.targetPath).readAsBytesSync(), audioBytes);
       }
-      expect(fake.downloadHits, 2);
+      // 每首各一次 download.view + 一次 stream。
+      expect(fake.requestedPaths, hasLength(4));
+      expect(
+        fake.requestedPaths.where((p) => p.endsWith('/stream')),
+        hasLength(2),
+      );
     });
   });
 
@@ -469,6 +507,7 @@ void main() {
       Map<String, dynamic>? downloadError,
       String? htmlBody,
       int? downloadStatusCode,
+      bool streamFails = false,
       RemoteServerType serverType = RemoteServerType.subsonic,
     }) async {
       SharedPreferences.setMockInitialValues({});
@@ -478,6 +517,7 @@ void main() {
         audioBytes: audioBytes,
         htmlBody: htmlBody,
         downloadStatusCode: downloadStatusCode,
+        streamFails: streamFails,
       );
       final server = RemoteServer(
         id: 'srv',
@@ -497,7 +537,7 @@ void main() {
       );
     }
 
-    test('code 50 直接抛出 SubsonicException，并清掉临时目录', () async {
+    test('code 50：改走播放通道拿到音频，临时目录里不留错误体', () async {
       final (:resolver, :fake, :server) = await bootstrap(
         downloadError: {'code': 50, 'message': 'downloads are disabled'},
       );
@@ -505,6 +545,28 @@ void main() {
 
       final musicFile = MusicFile(
         path: 'subsonic://srv/tr_tmp',
+        name: 'Song.mp3',
+        title: 'Song',
+        artist: 'Artist',
+        album: 'Album',
+      );
+
+      final file = await resolver.downloadRemoteTrackToTempFile(musicFile);
+      expect(file.readAsBytesSync(), audioBytes);
+      expect(fake.requestedPaths, hasLength(2));
+      expect(fake.requestedPaths.first, endsWith('/download.view'));
+      expect(fake.requestedPaths.last, endsWith('/stream'));
+    });
+
+    test('播放通道也被禁：抛出 SubsonicException 并清掉临时目录', () async {
+      final (:resolver, :fake, :server) = await bootstrap(
+        downloadError: {'code': 50, 'message': 'downloads are disabled'},
+        streamFails: true,
+      );
+      addTearDown(fake.stop);
+
+      final musicFile = MusicFile(
+        path: 'subsonic://srv/tr_tmp_both',
         name: 'Song.mp3',
         title: 'Song',
         artist: 'Artist',
@@ -519,7 +581,7 @@ void main() {
         ),
       );
 
-      // 临时目录必须清干净，否则 JSON 会留在 transcode_temp 里。
+      // 临时目录必须清干净，否则错误 JSON 会留在 transcode_temp 里。
       final transcodeRoot = Directory('${tempDir.path}/transcode_temp');
       final leftover = await transcodeRoot.exists()
           ? await transcodeRoot.list().toList()
@@ -643,8 +705,9 @@ class _StubSharingService extends SharingService {
 }
 
 /// 极简 Navidrome：`/rest/download.view` 要么回音频，要么回「HTTP 200 + 失败
-/// JSON」——后者正是真实服务端关闭下载时的表现；[htmlBody] 用来模拟反向代理
-/// 自己返回的 200 错误页。
+/// JSON」——后者正是真实服务端关闭下载时的表现；`/rest/stream` 默认始终可用
+/// （下载关闭不影响播放），[streamFails] 用来模拟连播放通道一起被禁；
+/// [htmlBody] 用来模拟反向代理自己返回的 200 错误页。
 class _FakeNavidrome {
   _FakeNavidrome._(
     this.server,
@@ -652,6 +715,7 @@ class _FakeNavidrome {
     this.audioBytes,
     this.htmlBody,
     this.downloadStatusCode,
+    this.streamFails,
   );
 
   final HttpServer server;
@@ -661,13 +725,20 @@ class _FakeNavidrome {
 
   /// 非空时下载端点直接回该状态码（Jellyfin 的拒绝方式）。
   final int? downloadStatusCode;
+
+  /// 播放通道也返回失败体（code 50），用于验证「回退也失败」时的收敛。
+  final bool streamFails;
   int downloadHits = 0;
+
+  /// 实际命中的端点（按请求顺序），用来断言「先 download 再 stream」。
+  final List<String> requestedPaths = [];
 
   static Future<_FakeNavidrome> start({
     Map<String, dynamic>? downloadError,
     required List<int> audioBytes,
     String? htmlBody,
     int? downloadStatusCode,
+    bool streamFails = false,
   }) async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final fake = _FakeNavidrome._(
@@ -676,6 +747,7 @@ class _FakeNavidrome {
       audioBytes,
       htmlBody,
       downloadStatusCode,
+      streamFails,
     );
     server.listen(fake._handle);
     return fake;
@@ -696,8 +768,8 @@ class _FakeNavidrome {
       return;
     }
 
-    final isDownload =
-        path.endsWith('/download.view') || path.endsWith('/stream');
+    final isStream = path.endsWith('/stream');
+    final isDownload = path.endsWith('/download.view') || isStream;
     if (!isDownload) {
       request.response.statusCode = HttpStatus.notFound;
       await request.response.close();
@@ -705,6 +777,7 @@ class _FakeNavidrome {
     }
 
     downloadHits++;
+    requestedPaths.add(path);
     if (downloadStatusCode != null) {
       request.response.statusCode = downloadStatusCode!;
       await request.response.close();
@@ -716,7 +789,8 @@ class _FakeNavidrome {
       await request.response.close();
       return;
     }
-    final hasError = downloadError != null;
+    // 关闭下载只影响 download.view；播放通道默认照常返回音频。
+    final hasError = isStream ? streamFails : downloadError != null;
     request.response.headers.contentType =
         hasError ? ContentType.json : ContentType.binary;
     request.response.add(

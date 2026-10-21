@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:collection/collection.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
@@ -707,6 +706,7 @@ class RemoteMediaResolver {
     // 2. Download from remote server
     final password = await storage.getPassword(server.id) ?? '';
     String downloadUrl;
+    String? fallbackUrl;
     Map<String, String>? headers;
 
     // 每种协议必须用各自的客户端：Jellyfin 的曲目 id 不是路径，SMB 也不是
@@ -714,6 +714,9 @@ class RemoteMediaResolver {
     if (info.type == RemoteServerType.subsonic) {
       final client = SubsonicClient(server: server, password: password);
       downloadUrl = client.buildDownloadUrl(info.trackIdOrPath);
+      // 服务端关闭下载时 download.view 返回 code 50，播放通道不受影响；
+      // 转码 / AI 分析要的是源音频，所以同样用 maxBitRate: 0 取原文件。
+      fallbackUrl = client.buildStreamUrl(info.trackIdOrPath, maxBitRate: 0);
     } else if (info.type == RemoteServerType.jellyfin) {
       final client = JellyfinClient(server: server, password: password);
       await client.authenticate();
@@ -752,7 +755,7 @@ class RemoteMediaResolver {
       }
     }
 
-    final response = await dio.download(
+    var response = await dio.download(
       downloadUrl,
       tempFile.path,
       onReceiveProgress: onProgress,
@@ -762,11 +765,35 @@ class RemoteMediaResolver {
     // 服务端失败同样是 200，只是响应体换成失败 JSON；反向代理出错时更可能是
     // 一张 HTML 错误页。不识别的话，转码/AI 分析拿到的是一个网页，报错会指向
     // ffmpeg / 音频解析器，掩盖真实原因。
-    final payloadError = RemotePayloadGuard.inspect(
+    var payloadError = _inspectPayload(
       tempFile,
-      contentType: response.headers.value(HttpHeaders.contentTypeHeader),
+      response,
       parseSubsonicError: info.type == RemoteServerType.subsonic,
     );
+
+    // 服务端关闭下载（code 50）：download.view 被拒，但播放通道仍可用。
+    // 转码 / AI 分析只需要音频字节，改走 stream 对调用方完全透明。
+    if (payloadError != null &&
+        payloadError.isDownloadsDisabled &&
+        fallbackUrl != null) {
+      debugPrint(
+          '[RemoteMediaResolver] 服务端关闭下载，改走播放通道：${info.trackIdOrPath}');
+      try {
+        await tempFile.delete();
+      } catch (_) {}
+      response = await dio.download(
+        fallbackUrl,
+        tempFile.path,
+        onReceiveProgress: onProgress,
+        cancelToken: cancelToken,
+      );
+      payloadError = _inspectPayload(
+        tempFile,
+        response,
+        parseSubsonicError: info.type == RemoteServerType.subsonic,
+      );
+    }
+
     if (payloadError != null) {
       try {
         await taskTempDir.delete(recursive: true);
@@ -775,6 +802,18 @@ class RemoteMediaResolver {
     }
 
     return tempFile;
+  }
+
+  static SubsonicException? _inspectPayload(
+    File file,
+    Response<dynamic> response, {
+    required bool parseSubsonicError,
+  }) {
+    return RemotePayloadGuard.inspect(
+      file,
+      contentType: response.headers.value(HttpHeaders.contentTypeHeader),
+      parseSubsonicError: parseSubsonicError,
+    );
   }
 }
 

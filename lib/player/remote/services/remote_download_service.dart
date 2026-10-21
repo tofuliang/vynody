@@ -48,6 +48,12 @@ class RemoteDownloadTask {
   final String? smbShare;
   final String? smbPath;
   final String downloadUrl;
+
+  /// 下载接口被拒（Subsonic code 50）时的备用地址：播放通道 `stream`。
+  ///
+  /// 服务端关闭下载后 `download.view` 直接失败，但播放不受影响，所以整张
+  /// 歌单/专辑的批量下载仍能完成。WebDAV / SMB / Jellyfin 没有这个区别。
+  final String? fallbackUrl;
   final Map<String, String>? headers;
   final String targetPath;
   final RemoteDownloadStatus status;
@@ -67,6 +73,7 @@ class RemoteDownloadTask {
     this.smbShare,
     this.smbPath,
     required this.downloadUrl,
+    this.fallbackUrl,
     this.headers,
     required this.targetPath,
     this.status = RemoteDownloadStatus.pending,
@@ -102,6 +109,7 @@ class RemoteDownloadTask {
       smbShare: smbShare,
       smbPath: smbPath,
       downloadUrl: downloadUrl,
+      fallbackUrl: fallbackUrl,
       headers: headers,
       targetPath: targetPath,
       status: status ?? this.status,
@@ -497,6 +505,7 @@ class RemoteDownloadNotifier extends Notifier<List<RemoteDownloadTask>> {
     }
 
     final downloadUrl = source.buildDownloadUrl(trackId);
+    final fallbackUrl = source.buildFallbackUrl(trackId);
 
     // Check if target file already exists locally
     if (await _checkFileExistsLocally(targetPath)) {
@@ -514,6 +523,7 @@ class RemoteDownloadNotifier extends Notifier<List<RemoteDownloadTask>> {
         song: song,
         trackId: trackId,
         downloadUrl: downloadUrl,
+        fallbackUrl: fallbackUrl,
         targetPath: targetPath,
         status: RemoteDownloadStatus.completed,
         bytesDownloaded: fileSize,
@@ -531,6 +541,7 @@ class RemoteDownloadNotifier extends Notifier<List<RemoteDownloadTask>> {
       song: song,
       trackId: trackId,
       downloadUrl: downloadUrl,
+      fallbackUrl: fallbackUrl,
       targetPath: targetPath,
       status: RemoteDownloadStatus.pending,
     );
@@ -863,50 +874,82 @@ class RemoteDownloadNotifier extends Notifier<List<RemoteDownloadTask>> {
     final tempFile = File(tempPath);
 
     try {
-      final response = await _dio.download(
-        task.downloadUrl,
-        tempPath,
-        cancelToken: cancelToken,
-        options: Options(
-          headers: task.headers,
-        ),
-        onReceiveProgress: (received, total) {
-          final now = DateTime.now();
-          final lastTime = _lastTimeMap[task.id] ?? now;
-          final lastBytes = _lastBytesMap[task.id] ?? 0;
-          final diffMs = now.difference(lastTime).inMilliseconds;
+      void reportProgress(int received, int total) {
+        final now = DateTime.now();
+        final lastTime = _lastTimeMap[task.id] ?? now;
+        final lastBytes = _lastBytesMap[task.id] ?? 0;
+        final diffMs = now.difference(lastTime).inMilliseconds;
 
-          double speed = 0.0;
-          if (diffMs >= 500) {
-            final byteDiff = received - lastBytes;
-            speed = (byteDiff / (diffMs / 1000.0));
-            _lastBytesMap[task.id] = received;
-            _lastTimeMap[task.id] = now;
-          }
+        double speed = 0.0;
+        if (diffMs >= 500) {
+          final byteDiff = received - lastBytes;
+          speed = (byteDiff / (diffMs / 1000.0));
+          _lastBytesMap[task.id] = received;
+          _lastTimeMap[task.id] = now;
+        }
 
-          // Throttle UI task updates to avoid overwhelming Riverpod/Flutter pipeline
-          if (diffMs < 100 && received < total) {
-            return;
-          }
+        // Throttle UI task updates to avoid overwhelming Riverpod/Flutter pipeline
+        if (diffMs < 100 && received < total) {
+          return;
+        }
 
-          _updateTask(task.id, (t) {
-            return t.copyWith(
-              bytesDownloaded: received,
-              totalBytes: total > 0 ? total : t.totalBytes,
-              speedBytesPerSec: speed > 0 ? speed : t.speedBytesPerSec,
-            );
-          });
-        },
-      );
+        _updateTask(task.id, (t) {
+          return t.copyWith(
+            bytesDownloaded: received,
+            totalBytes: total > 0 ? total : t.totalBytes,
+            speedBytesPerSec: speed > 0 ? speed : t.speedBytesPerSec,
+          );
+        });
+      }
+
+      Future<Response<dynamic>> fetch(String url) => _dio.download(
+            url,
+            tempPath,
+            cancelToken: cancelToken,
+            options: Options(
+              headers: task.headers,
+            ),
+            onReceiveProgress: reportProgress,
+          );
 
       // 二进制端点失败时同样回 200，只是响应体换成了失败 JSON（Subsonic code 50）
       // 或反代自己的 HTML 错误页。必须在「有没有字节」的判定之前识别，否则这些
       // 载荷会被当音频搬进音乐库并标记完成。
-      final payloadError = RemotePayloadGuard.inspect(
-        tempFile,
-        contentType: response.headers.value(HttpHeaders.contentTypeHeader),
-        parseSubsonicError: task.isSubsonic,
-      );
+      SubsonicException? inspectPayload(Response<dynamic> response) =>
+          RemotePayloadGuard.inspect(
+            tempFile,
+            contentType: response.headers.value(HttpHeaders.contentTypeHeader),
+            parseSubsonicError: task.isSubsonic,
+          );
+
+      var response = await fetch(task.downloadUrl);
+      var payloadError = inspectPayload(response);
+
+      // 服务端关闭下载时 `download.view` 直接返回 code 50，但播放通道照常可用。
+      // 同一首曲目改走 `stream` 再取一次，整张歌单/专辑的下载才不会被一个
+      // 服务端开关打断；取到的仍是原文件（fallbackUrl 用 maxBitRate: 0 构造）。
+      final fallbackUrl = task.fallbackUrl;
+      if (payloadError != null &&
+          payloadError.isDownloadsDisabled &&
+          fallbackUrl != null) {
+        debugPrint(
+            '[RemoteDownload] 服务端关闭下载，改走播放通道：${task.song.displayName}');
+        if (tempFile.existsSync()) {
+          try {
+            tempFile.deleteSync();
+          } catch (_) {}
+        }
+        _lastBytesMap[task.id] = 0;
+        _lastTimeMap[task.id] = DateTime.now();
+        _updateTask(task.id, (t) => t.copyWith(
+              bytesDownloaded: 0,
+              totalBytes: 0,
+              speedBytesPerSec: 0,
+            ));
+        response = await fetch(fallbackUrl);
+        payloadError = inspectPayload(response);
+      }
+
       if (payloadError != null) throw payloadError;
 
       if (tempFile.existsSync() && tempFile.lengthSync() > 0) {
@@ -1300,6 +1343,12 @@ abstract class _StructuredDownloadSource {
 
   String buildDownloadUrl(String trackId);
 
+  /// 下载接口被禁时的备用地址；返回 null 表示该协议没有「另一条通道」。
+  ///
+  /// 只有 Subsonic/Navidrome 会把「下载」和「播放」分成两个权限：关闭下载后
+  /// `download.view` 返回 code 50，但 `stream.view` 照常可用。
+  String? buildFallbackUrl(String trackId) => null;
+
   /// 远端路径里取不到 id 时的兜底，保证同一首歌在队列里稳定同一个 id。
   static String fallbackTrackId(MusicFile song) =>
       song.id != null && song.id! > 0
@@ -1323,6 +1372,11 @@ class _SubsonicDownloadSource extends _StructuredDownloadSource {
 
   @override
   String buildDownloadUrl(String trackId) => _client.buildDownloadUrl(trackId);
+
+  /// 播放通道取原文件（`maxBitRate: 0` → 不转码），与下载得到的字节一致。
+  @override
+  String? buildFallbackUrl(String trackId) =>
+      _client.buildStreamUrl(trackId, maxBitRate: 0);
 }
 
 class _JellyfinDownloadSource extends _StructuredDownloadSource {
